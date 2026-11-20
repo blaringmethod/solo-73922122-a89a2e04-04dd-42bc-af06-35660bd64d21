@@ -122,3 +122,103 @@ class CorrectRequest(BaseModel):
     valid_from: AwareDatetime
     valid_to: AwareDatetime
     watershed: str = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# 台账复核(只读分析)
+# ---------------------------------------------------------------------------
+
+class LedgerPeriodIn(BaseModel):
+    """台账中的一条归属时段: 左闭右开 [valid_from, valid_to), UTC 起止均必填."""
+
+    watershed: str = Field(min_length=1, max_length=128)
+    valid_from: AwareDatetime
+    valid_to: AwareDatetime
+
+
+class LedgerIn(BaseModel):
+    """一份移交台账: 整份保留或整份搁置."""
+
+    ledger_id: str = Field(min_length=1, max_length=64)
+    periods: list[LedgerPeriodIn] = Field(default_factory=list, max_length=8)
+
+
+class LedgerReviewRequest(BaseModel):
+    """台账复核请求: 站号 + UTC 左闭右开核查区间 + 至多 16 份编号各异的台账."""
+
+    station_id: str = Field(min_length=1, max_length=64)
+    check_from: AwareDatetime
+    check_to: AwareDatetime
+    ledgers: list[LedgerIn] = Field(default_factory=list, max_length=16)
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "station_id": "ST-1",
+                    "check_from": "2020-01-01T00:00:00Z",
+                    "check_to": "2021-01-01T00:00:00Z",
+                    "ledgers": [
+                        {
+                            "ledger_id": "L-2020-A",
+                            "periods": [
+                                {"watershed": "WS-A",
+                                 "valid_from": "2020-01-01T00:00:00Z",
+                                 "valid_to": "2020-07-01T00:00:00Z"}
+                            ],
+                        },
+                        {
+                            "ledger_id": "L-2020-B",
+                            "periods": [
+                                {"watershed": "WS-B",
+                                 "valid_from": "2020-06-01T00:00:00Z",
+                                 "valid_to": "2021-01-01T00:00:00Z"}
+                            ],
+                        },
+                        {
+                            "ledger_id": "L-2020-FULL",
+                            "periods": [
+                                {"watershed": "WS-A",
+                                 "valid_from": "2020-01-01T00:00:00Z",
+                                 "valid_to": "2020-06-01T00:00:00Z"},
+                                {"watershed": "WS-B",
+                                 "valid_from": "2020-06-01T00:00:00Z",
+                                 "valid_to": "2021-01-01T00:00:00Z"},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class UncoveredRangeOut(BaseModel):
+    """有观测但无任何台账时段覆盖的时间段."""
+
+    interval_from: datetime
+    interval_to: datetime
+    observation_count: int
+
+
+class LedgerDispositionOut(BaseModel):
+    """单份台账在所有最优方案中的处置分类."""
+
+    ledger_id: str
+    disposition: Literal["kept_in_all_optimal", "shelved_in_all_optimal", "both"]
+
+
+class LedgerReviewResponse(BaseModel):
+    """复核结果. feasible=false 时 min_shelved/solution/ledgers 为 null, reasons 说明原因."""
+
+    station_id: str
+    check_from: datetime
+    check_to: datetime
+    observations_scanned: int
+    feasible: bool
+    min_shelved: Optional[int] = None
+    solution: Optional[dict[str, Literal["keep", "shelve"]]] = None
+    ledgers: Optional[list[LedgerDispositionOut]] = None
+    self_conflicted: list[str] = Field(default_factory=list)
+    uncovered_ranges: list[UncoveredRangeOut] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)

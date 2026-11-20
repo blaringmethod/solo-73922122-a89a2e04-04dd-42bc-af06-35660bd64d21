@@ -24,6 +24,9 @@ docker compose exec -T db psql postgresql://watershed:watershed@localhost:5432/w
 echo "== 示例4: 并发撤段 vs 补录 =="
 bash examples/04_concurrent_conflict.sh
 
+echo "== 示例5: 台账复核(只读) =="
+bash examples/05_ledger_review.sh
+
 echo "== 集成测试 =="
 python3 -m venv .venv
 .venv/bin/pip install -q -r tests/requirements.txt

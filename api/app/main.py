@@ -19,13 +19,18 @@ from .db import close_pool, get_pool, init_pool
 from .models import (
     ChangeSet,
     CorrectRequest,
+    LedgerDispositionOut,
+    LedgerReviewRequest,
+    LedgerReviewResponse,
     MergeRequest,
     ObservationIn,
     SplitRequest,
     StationIn,
     TransferRequest,
+    UncoveredRangeOut,
     to_utc,
 )
+from .review import LedgerPeriod, ReviewInput, ReviewSolver
 
 DESCRIPTION = """维护站点-流域归属时段与站点观测。
 
@@ -33,6 +38,8 @@ DESCRIPTION = """维护站点-流域归属时段与站点观测。
 * 同站时段不得重叠；每条观测须恰有一段归属
 * `/changesets` 可在一笔事务内拆分/合并/更正时段并补改观测，中途允许暂时违规，提交时统一校验
 * 冲突（含并发冲突、死锁）整笔拒绝，返回 409
+* `/ledger-review`（只读）：对旧移交台账求"搁置份数最少"的取舍方案，
+  观测取自同一已提交快照（REPEATABLE READ READ ONLY），流式扫描，内存不随观测条数增长
 """
 
 
@@ -430,3 +437,106 @@ def attributed_feed(
     pool = get_pool()
     with pool.connection() as conn:
         return conn.execute(sql, params).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# 台账复核(只读): 求搁置份数最少的取舍方案
+# ---------------------------------------------------------------------------
+
+@app.post("/ledger-review", response_model=LedgerReviewResponse, tags=["review"])
+def ledger_review(body: LedgerReviewRequest):
+    """旧移交台账复核(只读, 不写库).
+
+    在核查区间 `[check_from, check_to)` 内对每份台账整份取舍:
+
+    * 保留的时段可重叠, 但同一时刻至多一个流域(重叠时段流域必须一致);
+    * 区间内该站每条观测都须被至少一份保留台账覆盖;
+    * 目标: 搁置份数最少.
+
+    返回一个最优方案, 并逐份标明该台账在**所有**最优方案中是
+    必保留 / 必搁置 / 两者皆可; 无解时 `feasible=false` 并说明原因.
+
+    观测在单个 `REPEATABLE READ READ ONLY` 事务内以服务端游标流式读取:
+    全部读取来自同一已提交快照, 且内存占用不随观测条数增长.
+    """
+    check_from, check_to = to_utc(body.check_from), to_utc(body.check_to)
+    if not check_from < check_to:
+        raise HTTPException(status_code=422, detail="check_from must be before check_to")
+
+    ledger_ids = [lg.ledger_id for lg in body.ledgers]
+    if len(set(ledger_ids)) != len(ledger_ids):
+        raise HTTPException(status_code=422, detail="ledger_id values must be distinct")
+
+    periods: list[list[LedgerPeriod]] = []
+    for lg in body.ledgers:
+        ps = []
+        for p in lg.periods:
+            vfrom, vto = to_utc(p.valid_from), to_utc(p.valid_to)
+            if not vfrom < vto:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"ledger {lg.ledger_id}: valid_from must be before valid_to",
+                )
+            ps.append(LedgerPeriod(watershed=p.watershed, valid_from=vfrom, valid_to=vto))
+        periods.append(ps)
+
+    solver = ReviewSolver(
+        ReviewInput(
+            check_from=check_from,
+            check_to=check_to,
+            ledger_ids=ledger_ids,
+            periods=periods,
+        )
+    )
+
+    pool = get_pool()
+    with pool.connection() as conn:
+        # 同一已提交快照: 站点检查与观测流式扫描在同一 REPEATABLE READ 只读事务内
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        conn.read_only = True
+        try:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT 1 FROM stations WHERE station_id = %s", (body.station_id,)
+                ).fetchone()
+                if row is None:
+                    raise HTTPException(404, detail=f"station {body.station_id} not found")
+                with conn.cursor() as cur:
+                    for obs in cur.stream(
+                        """
+                        SELECT observed_at FROM observations
+                        WHERE station_id = %s AND observed_at >= %s AND observed_at < %s
+                        ORDER BY observed_at
+                        """,
+                        (body.station_id, check_from, check_to),
+                    ):
+                        solver.mark_observation(obs["observed_at"])
+        finally:
+            conn.read_only = False
+            conn.isolation_level = None
+
+    result = solver.solve()
+    return LedgerReviewResponse(
+        station_id=body.station_id,
+        check_from=check_from,
+        check_to=check_to,
+        observations_scanned=result.observations_scanned,
+        feasible=result.feasible,
+        min_shelved=result.min_shelved,
+        solution=result.solution,
+        ledgers=(
+            [LedgerDispositionOut(ledger_id=k, disposition=v)
+             for k, v in result.dispositions.items()]
+            if result.dispositions is not None else None
+        ),
+        self_conflicted=result.self_conflicted,
+        uncovered_ranges=[
+            UncoveredRangeOut(
+                interval_from=u.interval_from,
+                interval_to=u.interval_to,
+                observation_count=u.observation_count,
+            )
+            for u in result.uncovered
+        ],
+        reasons=result.reasons,
+    )
